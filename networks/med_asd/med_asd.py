@@ -6,6 +6,8 @@ import numpy as np
 import scipy
 import torch
 from sklearn import metrics
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from networks.base_model import BaseModel
@@ -32,7 +34,7 @@ class MEDASD(BaseModel):
         return MEDFeatureExtractor(cutoff_list=cutoffs, sample_rate=self.args.med_sample_rate)
 
     def get_log_header(self):
-        return "loss,source_count,target_count,embedding_dim"
+        return "loss,source_count,target_count,embedding_dim,pca_dim"
 
     def train(self, epoch):
         if epoch > 1:
@@ -41,11 +43,13 @@ class MEDASD(BaseModel):
         print("\n============== FIT MED-ASD MAHALANOBIS ==============")
         self.model.eval()
         embeddings, basenames = self.extract_embeddings(self.train_loader)
-        is_target = np.asarray(["target" in basename for basename in basenames], dtype=bool)
+        is_target = np.asarray(["target" in basename.lower() for basename in basenames], dtype=bool)
         is_source = np.logical_not(is_target)
 
-        source_embeddings = embeddings[is_source]
-        target_embeddings = embeddings[is_target]
+        transform = self.fit_embedding_transform(embeddings)
+        embeddings_pca = self.apply_embedding_transform(embeddings, transform)
+        source_embeddings = embeddings_pca[is_source]
+        target_embeddings = embeddings_pca[is_target]
         source_stats = self.fit_gaussian(source_embeddings)
         target_stats = self.fit_gaussian(target_embeddings if len(target_embeddings) > 1 else source_embeddings)
 
@@ -55,6 +59,7 @@ class MEDASD(BaseModel):
             "cutoffs": self.args.med_cutoffs,
             "sample_rate": self.args.med_sample_rate,
             "audio_samples": self.args.med_audio_samples,
+            "embedding_transform": transform,
         }
         torch.save(stats, self.stats_path)
         torch.save(self.model.state_dict(), self.model_path)
@@ -68,10 +73,11 @@ class MEDASD(BaseModel):
             self.checkpoint_path,
         )
 
-        train_scores = self.score_embeddings(embeddings, stats).cpu().numpy().tolist()
-        if len(self.valid_loader) > 0:
+        train_scores = self.score_embeddings(embeddings_pca, stats).cpu().numpy().tolist()
+        if hasattr(self, "valid_loader") and self.valid_loader is not None and len(self.valid_loader) > 0:
             valid_embeddings, _ = self.extract_embeddings(self.valid_loader)
-            train_scores.extend(self.score_embeddings(valid_embeddings, stats).cpu().numpy().tolist())
+            valid_embeddings_pca = self.apply_embedding_transform(valid_embeddings, transform)
+            train_scores.extend(self.score_embeddings(valid_embeddings_pca, stats).cpu().numpy().tolist())
         self.fit_anomaly_score_distribution(
             y_pred=train_scores,
             score_distr_file_path=self.score_distr_file_path,
@@ -81,11 +87,12 @@ class MEDASD(BaseModel):
             np.savetxt(
                 log,
                 [
-                    "{0},{1},{2},{3}".format(
+                    "{0},{1},{2},{3},{4}".format(
                         0.0,
                         int(is_source.sum()),
                         int(is_target.sum()),
                         int(embeddings.shape[1]),
+                        int(embeddings_pca.shape[1]),
                     )
                 ],
                 fmt="%s",
@@ -101,6 +108,32 @@ class MEDASD(BaseModel):
                 zs.append(z)
                 basenames.extend(list(batch[3]))
         return torch.cat(zs, dim=0), basenames
+
+    def fit_embedding_transform(self, embeddings):
+        embeddings_np = embeddings.numpy()
+        scaler = StandardScaler()
+        embeddings_scaled = scaler.fit_transform(embeddings_np)
+        max_components = min(self.args.med_pca_dim, embeddings_scaled.shape[0] - 1, embeddings_scaled.shape[1])
+        if max_components < 1:
+            raise ValueError("PCA needs at least two training embeddings for MED-ASD.")
+
+        pca = PCA(n_components=max_components, svd_solver="auto", random_state=self.args.seed)
+        pca.fit(embeddings_scaled)
+        return {
+            "scaler_mean": torch.from_numpy(scaler.mean_.astype(np.float32)),
+            "scaler_scale": torch.from_numpy(scaler.scale_.astype(np.float32)),
+            "pca_mean": torch.from_numpy(pca.mean_.astype(np.float32)),
+            "pca_components": torch.from_numpy(pca.components_.astype(np.float32)),
+            "pca_explained_variance_ratio": torch.from_numpy(pca.explained_variance_ratio_.astype(np.float32)),
+        }
+
+    @staticmethod
+    def apply_embedding_transform(embeddings, transform):
+        mean = transform["scaler_mean"]
+        scale = torch.clamp(transform["scaler_scale"], min=1e-12)
+        scaled = (embeddings - mean) / scale
+        centered = scaled - transform["pca_mean"]
+        return centered.matmul(transform["pca_components"].t())
 
     def fit_gaussian(self, embeddings):
         if len(embeddings) == 0:
@@ -167,15 +200,18 @@ class MEDASD(BaseModel):
             with torch.no_grad():
                 for batch in tqdm(test_loader_tmp):
                     data = batch[0].to(self.device).float()
-                    basename = batch[3][0]
                     z = self.model(data).detach().cpu()
-                    score = self.score_embeddings(z, stats).item()
-                    y_pred.append(score)
-                    y_true.append(batch[1][0].item())
-                    anomaly_score_list.append([basename, score])
-                    decision_result_list.append([basename, 1 if score > decision_threshold else 0])
-                    if mode:
-                        domain_list.append("target" if "target" in basename else "source")
+                    z = self.apply_embedding_transform(z, stats["embedding_transform"])
+                    scores = self.score_embeddings(z, stats).cpu().numpy()
+                    labels = batch[1].cpu().numpy()
+                    for basename, score, label in zip(batch[3], scores, labels):
+                        score = float(score)
+                        y_pred.append(score)
+                        y_true.append(int(label))
+                        anomaly_score_list.append([basename, score])
+                        decision_result_list.append([basename, 1 if score > decision_threshold else 0])
+                        if mode:
+                            domain_list.append("target" if "target" in basename.lower() else "source")
 
             save_csv(save_file_path=anomaly_score_csv, save_data=anomaly_score_list)
             print(f"anomaly score result ->  {anomaly_score_csv}")

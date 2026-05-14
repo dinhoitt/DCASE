@@ -94,15 +94,9 @@ class MEDFeatureExtractor(nn.Module):
     def pool_fmaps(fmaps):
         pooled = []
         for feat in fmaps:
-            pooled.extend(
-                [
-                    feat.mean(dim=(1, 2)),
-                    feat.std(dim=(1, 2), unbiased=False),
-                    feat.amin(dim=(1, 2)),
-                    feat.amax(dim=(1, 2)),
-                ]
-            )
-        return torch.stack(pooled, dim=1)
+            pooled.append(feat.mean(dim=-1))
+            pooled.append(feat.std(dim=-1, unbiased=False))
+        return torch.cat(pooled, dim=1)
 
     def forward_one_channel(self, x):
         embeddings = []

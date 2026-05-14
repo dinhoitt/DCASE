@@ -112,6 +112,8 @@ def get_argparse():
                         help='Batch size used by MED-ASD waveform loaders')
     parser.add_argument('--med_cutoffs', type=float_list, default=[-1, 0, 1, 300, 500],
                         help='Comma-separated fixed MED cutoff list, e.g. -1,0,1,300,500')
+    parser.add_argument('--med_pca_dim', type=int, default=64,
+                        help='PCA dimension for channel-wise MED-ASD embeddings')
     parser.add_argument('--med_cov_eps', type=float, default=1e-3,
                         help='Diagonal shrinkage added to MED-ASD covariance matrices')
 
